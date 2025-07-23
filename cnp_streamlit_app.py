@@ -6,8 +6,23 @@ import random
 import streamlit as st
 import tempfile
 import time
+import threading
 
-# AES encryption/decryption
+# AES encryption/decryption with visualization
+
+def aes_encrypt_visual(data, key):
+    pad_len = 16 - (len(data) % 16)
+    data += bytes([pad_len]) * pad_len
+    cipher = AES.new(key, AES.MODE_ECB)
+    blocks = [data[i:i+16] for i in range(0, len(data), 16)]
+    encrypted_blocks = []
+    st.subheader("🔐 AES Encryption Steps")
+    for i, block in enumerate(blocks):
+        encrypted = cipher.encrypt(block)
+        encrypted_blocks.append(encrypted)
+        st.code(f"Block {i+1} Input:  {block.hex()}\nBlock {i+1} Encrypted: {encrypted.hex()}", language='text')
+        time.sleep(0.5)
+    return b"".join(encrypted_blocks)
 
 def aes_encrypt(data, key):
     pad_len = 16 - (len(data) % 16)
@@ -74,7 +89,6 @@ def simulate_tcp_on_data(total_packets, ssthresh_init, loss_packets, variant="Ta
     ack_series = []
     state_series = []
     transitions = []
-    dup_ack = 0
 
     time_step = 0
     i = 0
@@ -90,7 +104,6 @@ def simulate_tcp_on_data(total_packets, ssthresh_init, loss_packets, variant="Ta
             ssthresh = max(cwnd / 2, 1)
             cwnd = 1 if variant == "Tahoe" else max(1, ssthresh)
             state = 'Slow Start'
-            dup_ack = 0
         else:
             if state == 'Slow Start':
                 cwnd *= 2
@@ -104,63 +117,61 @@ def simulate_tcp_on_data(total_packets, ssthresh_init, loss_packets, variant="Ta
 
     return time_series, cwnd_series, ssthresh_series, ack_series, state_series, transitions
 
-# Plotting TCP graphs with animation
+# Multithreaded version for multiple flows
 
-def plot_graphs(time_series, cwnd_series, ssthresh_series, ack_series, transitions):
+def simulate_multiple_flows(num_flows, total_packets, ssthresh_init, variant, loss_rate):
+    all_results = [None] * num_flows
+    threads = []
+
+    def simulate_flow(flow_id):
+        loss_packets = sorted(random.sample(range(total_packets), int((loss_rate / 100) * total_packets)))
+        results = simulate_tcp_on_data(total_packets, ssthresh_init, loss_packets, variant=variant)
+        all_results[flow_id] = {
+            'flow_id': flow_id,
+            'loss_packets': loss_packets,
+            'time_series': results[0],
+            'cwnd_series': results[1],
+            'ssthresh_series': results[2],
+            'ack_series': results[3],
+            'state_series': results[4],
+            'transitions': results[5]
+        }
+
+    for flow_id in range(num_flows):
+        thread = threading.Thread(target=simulate_flow, args=(flow_id,))
+        threads.append(thread)
+        thread.start()
+
+    for thread in threads:
+        thread.join()
+
+    return all_results
+
+# Plotting TCP graphs with animation for multiple flows
+
+def plot_multiple_flow_graphs(all_results):
     chart_placeholder = st.empty()
-    table_placeholder = st.empty()
-
-    for idx in range(1, len(time_series) + 1):
-        fig, ax = plt.subplots(2, 1, figsize=(10, 6))
-
-        ax[0].step(time_series[:idx], cwnd_series[:idx], where='post', label='CWND', linewidth=2)
-        ax[0].step(time_series[:idx], ssthresh_series[:idx], where='post', label='SSTHRESH', linestyle='--')
-        ax[0].set_title('TCP Congestion Window Evolution')
-        ax[0].set_xlabel('Time')
-        ax[0].set_ylabel('Window Size')
-        ax[0].legend()
-        ax[0].grid(True)
-
-        ax[1].plot(ack_series[:idx], cwnd_series[:idx], 'o-', label='ACKs')
-        ax[1].set_title('ACKs and CWND')
-        ax[1].set_xlabel('Packet Index')
-        ax[1].set_ylabel('CWND Size')
-        ax[1].grid(True)
-
+    max_len = max(len(result['time_series']) for result in all_results)
+    for idx in range(max_len):
+        fig, ax = plt.subplots(figsize=(10, 6))
+        for result in all_results:
+            flow_id = result['flow_id']
+            time_series = result['time_series']
+            cwnd_series = result['cwnd_series']
+            if idx < len(time_series):
+                ax.step(time_series[:idx+1], cwnd_series[:idx+1], where='post', label=f'Flow {flow_id}')
+        ax.set_title('Multi-flow TCP Congestion Window Evolution')
+        ax.set_xlabel('Time')
+        ax.set_ylabel('CWND')
+        ax.grid(True)
+        ax.legend()
         chart_placeholder.pyplot(fig)
         time.sleep(0.2)
-
-# RIP Routing graph visualization
-
-def plot_rip_graph(rip_table, source=None, target=None):
-    G = nx.DiGraph()
-    for entry in rip_table:
-        src = entry['node']
-        dst = entry['dest']
-        weight = entry['distance']
-        G.add_edge(src, dst, weight=weight)
-
-    pos = nx.spring_layout(G, seed=42)
-    labels = nx.get_edge_attributes(G, 'weight')
-
-    fig, ax = plt.subplots(figsize=(8, 6))
-    nx.draw(G, pos, with_labels=True, node_size=800, node_color='lightblue', font_size=12, ax=ax)
-    nx.draw_networkx_edge_labels(G, pos, edge_labels=labels, ax=ax)
-    ax.set_title('RIP Routing Topology')
-
-    st.pyplot(fig)
-
-    if source is not None and target is not None:
-        try:
-            path = nx.dijkstra_path(G, source=source, target=target, weight='weight')
-            st.success(f"Shortest path from {source} to {target}: {path}")
-        except nx.NetworkXNoPath:
-            st.error(f"No path found from {source} to {target}.")
 
 # Streamlit App
 
 def main():
-    st.title("Network Simulation Project")
+    st.title("Network Simulation Project - Multi-Flow TCP")
 
     uploaded_file = st.file_uploader("Upload input text file", type=["txt"])
     if not uploaded_file:
@@ -173,11 +184,12 @@ def main():
     packet_size = st.number_input("Enter MSS (Maximum Segment Size) in bytes", min_value=1, value=64)
     ssthresh_init = st.number_input("Enter initial SSTHRESH value", min_value=1, value=8)
     variant = st.selectbox("Select TCP Variant", ["Tahoe", "Reno"])
-    num_nodes = st.number_input("Enter number of nodes for RIP", min_value=1, value=3)
     error_rate = st.slider("Select Bit Error Rate (%)", 0, 100, 0)
+    loss_rate = st.slider("Select packet loss rate (%)", 0, 100, 20)
+    num_flows = st.slider("Select number of simultaneous TCP flows", 1, 5, 2)
 
     key = b"thisisasecretkey"
-    encrypted_data = aes_encrypt(data, key)
+    encrypted_data = aes_encrypt_visual(data, key)
     stuffed_data = character_stuff(encrypted_data)
 
     if error_rate > 0:
@@ -185,50 +197,25 @@ def main():
 
     total_packets = (len(stuffed_data) + packet_size - 1) // packet_size
 
-    loss_rate = st.slider("Select packet loss rate (%)", 0, 100, 20)
-    loss_packets = sorted(random.sample(range(total_packets), int((loss_rate / 100) * total_packets)))
-
     st.subheader("Encryption & Stuffing")
     st.write(f"Encrypted Data Length: {len(encrypted_data)} bytes")
     st.code(encrypted_data.hex(), language='text')
     st.write(f"Stuffed Data Length: {len(stuffed_data)} bytes")
     st.code(stuffed_data.hex(), language='text')
     st.write(f"Total packets: {total_packets}")
-    st.write(f"Randomly lost packets: {loss_packets}")
 
-    st.subheader("RIP Routing Table")
-    rip_table = []
-    for i in range(num_nodes):
-        st.markdown(f"#### Node {i} Routes")
-        num_routes = st.number_input(f"Number of routes for Node {i}", min_value=1, max_value=10, value=2, key=f"routes_{i}")
-        for j in range(num_routes):
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                dest = st.number_input(f"Dest Node", key=f"dest_{i}_{j}")
-            with col2:
-                next_hop = st.number_input(f"Next Hop", key=f"hop_{i}_{j}")
-            with col3:
-                distance = st.number_input(f"Distance", key=f"dist_{i}_{j}")
-            rip_table.append({'node': i, 'dest': dest, 'next_hop': next_hop, 'distance': distance})
+    if st.button("Run Multi-Flow Simulation"):
+        all_results = simulate_multiple_flows(num_flows, total_packets, ssthresh_init, variant, loss_rate)
 
-    source = st.number_input("Enter source node for path query", min_value=0, value=0, key="source_node")
-    target = st.number_input("Enter destination node for path query", min_value=0, value=1, key="target_node")
+        st.subheader("Multi-Flow CWND Animation")
+        plot_multiple_flow_graphs(all_results)
 
-    if st.button("Run Simulation"):
-        time_series, cwnd_series, ssthresh_series, ack_series, state_series, transitions = simulate_tcp_on_data(
-            total_packets, ssthresh_init, loss_packets, variant=variant)
-
-        st.subheader("TCP CWND Animation")
-        plot_graphs(time_series, cwnd_series, ssthresh_series, ack_series, transitions)
-
-        st.subheader("RIP Topology")
-        plot_rip_graph(rip_table, source=source, target=target)
-
-        st.subheader("TCP Event Table")
-        st.text("%-10s %-10s %-10s %-20s" % ("Time", "CWND", "SSTHRESH", "State"))
-        st.text("-" * 50)
-        for t, c, ssth, state in zip(time_series, cwnd_series, ssthresh_series, state_series):
-            st.text("%-10.2f %-10.2f %-10d %-20s" % (t, c, ssth, state))
+        for result in all_results:
+            st.subheader(f"Flow {result['flow_id']} - TCP Event Table")
+            st.text("%-10s %-10s %-10s %-20s" % ("Time", "CWND", "SSTHRESH", "State"))
+            st.text("-" * 50)
+            for t, c, ssth, state in zip(result['time_series'], result['cwnd_series'], result['ssthresh_series'], result['state_series']):
+                st.text("%-10.2f %-10.2f %-10d %-20s" % (t, c, ssth, state))
 
         st.subheader("Receiver Output")
         try:
